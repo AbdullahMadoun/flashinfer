@@ -457,8 +457,14 @@ void ExecuteAttentionPlanImpl(ffi::Module descriptor, TensorView q, TensorView c
                               ? static_cast<const int*>(extra_lengths.value().data_ptr())
                               : nullptr;
   }
-  if (m.variant == 0) check_decode_scratch_capacity(q, mid, mlse, plan.chunk_capacity);
+  if (m.variant == 0 && plan.partial_bytes)
+    check_decode_scratch_capacity(q, mid, mlse, plan.chunk_capacity);
   ffi::CUDADeviceGuard guard(q.device().device_id);
+  if (plan.implementation == execution::Implementation::CuteLowLatency) {
+    const auto status = dispatch_cute_decode(p, plan, get_stream(q.device()));
+    TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "CuTe decode: " << cudaGetErrorString(status);
+    return;
+  }
   if (m.variant != 0) {
     TVM_FFI_ICHECK(plan.numeric == execution::NumericRoute::FullBF16 ||
                    (indices.IsContiguous() &&
