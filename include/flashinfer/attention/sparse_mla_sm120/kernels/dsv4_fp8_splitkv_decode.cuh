@@ -30,7 +30,18 @@ struct alignas(128) Shared {
   float scores[Warps][8 * 32];
   int ids[2][32];
 };
+// Mega follows the attention-side boundary of FlashMLA's decode(nonorm):
+//   BF16 Q -> adjacent-pair RoPE on the last 64 features -> BF16 -> Q quantization
+//   -> sparse QK/softmax/PV (including sink) -> BF16 context -> inverse RoPE
+//   -> FP8 E4M3 output with one UE8M0 scale per 32 features.
+// Q RMSNorm, learned projections, cache packing, and index selection are inputs
+// to this launch. Mega=false keeps the same attention arithmetic with BF16 I/O.
 // A task owns one query, 8 heads/warp, and its selected KV range.
+// H=64 uses 24/24/16-head tasks. All warps, including the final inactive head
+// warp, participate in the pipelines and cluster barriers; stores mask H tails.
+// Split CTAs publish normalized BF16 context and base-2 LSE, rendezvous, and
+// share the final merge/epilogue. Empty chunks publish zero context and -inf LSE.
+// Scratch belongs to the invocation; no initialization kernel/counter is needed.
 // Every warp executes QK -> online softmax -> PV. All warps share the sparse
 // gather, so there are no separate QK/PV roles or register handoff barriers.
 template <int Warps, bool Mega = true, int FixedSplits = 0>

@@ -1075,10 +1075,17 @@ class _SparseMLAPagedAttentionRunner:
         Decode each scale as exp2(output_scales.float() - 127), repeat it
         over its 32 features, and multiply by output.float(). The context
         is rounded to BF16 before FP32 inverse RoPE and FP8 quantization.
-        The caller handles Q normalization and learned projections.
+        The attention-side fusion follows FlashMLA decode with
+        ``enable_q_norm=False``: Q RoPE -> BF16 -> sparse attention with sink
+        normalization -> BF16 context -> inverse RoPE -> FP8 cast. Q RMSNorm,
+        learned projections, KV cache construction and sparse-index selection
+        are caller operations. This API stores contiguous output and scale
+        tensors rather than FlashMLA's projection-grouped scale layout.
 
-        ``impl="auto"`` selects the CuTe split-KV decode-splitkv or pipelined
-        decode implementation by head-task parallelism / SM count.
+        ``impl="decode-splitkv"`` divides selected KV across CTA clusters and
+        merges their partial contexts inside the attention launch. ``"decode"``
+        reuses the pipelined prefill backbone without splitting KV.
+        ``impl="auto"`` chooses by head-task parallelism and SM wave counts.
         Explicit ``"decode-splitkv"`` and ``"decode"`` require inline
         FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64.
 
@@ -1161,8 +1168,10 @@ class _SparseMLAPagedAttentionRunner:
 
         ``impl`` accepts ``"auto"`` (default), ``"decode-splitkv"`` or
         ``"decode"``. For flat inline FP8 KV with H=8/16/32/64,
-        auto selects by query/head-task parallelism relative to SM count.
-        Explicit choices require this format and cannot be combined with a
+        auto selects by query/head-task parallelism relative to SM count and
+        the number of resident CTA waves. ``"decode"`` uses the pipelined
+        backbone; ``"decode-splitkv"`` uses local KV chunks and an in-kernel
+        cluster merge. Explicit choices require this format and cannot be combined with a
         ``prefill_impl`` override. Other formats retain their existing auto policy.
 
         ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
