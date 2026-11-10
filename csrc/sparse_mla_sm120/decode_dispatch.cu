@@ -86,6 +86,45 @@ cudaError_t dispatch_decode(const execution::AttentionParams& p,
 }
 
 namespace execution {
+namespace {
+
+int splitkv_compute_warps(int heads) { return heads == 64 ? 3 : std::min(heads / 8, 4); }
+
+size_t splitkv_shared_bytes(int warps) {
+  switch (warps) {
+    case 1:
+      return sizeof(dsv4_fp8_splitkv_decode::Shared<1>);
+    case 2:
+      return sizeof(dsv4_fp8_splitkv_decode::Shared<2>);
+    case 3:
+      return sizeof(dsv4_fp8_splitkv_decode::Shared<3>);
+    default:
+      return sizeof(dsv4_fp8_splitkv_decode::Shared<4>);
+  }
+}
+
+Implementation get_implementation(const AttentionMetadata& m, int64_t mode, int64_t sm_count) {
+  if (mode == 1) return Implementation::Dsv4Fp8SplitKVDecode;
+  if (mode == 2) return Implementation::Dsv4Fp8Decode;
+
+  const int warps = splitkv_compute_warps(m.heads);
+  const int64_t splitkv_tasks = int64_t(m.tokens) * ((m.heads + warps * 8 - 1) / (warps * 8));
+  const int64_t decode_tasks = int64_t(m.tokens) * ((m.heads + 31) / 32);
+  const int64_t splitkv_capacity = sm_count * (warps == 4 ? 1 : 2);
+  const int64_t decode_waves = (decode_tasks + sm_count - 1) / sm_count;
+  const int64_t splitkv_waves = (splitkv_tasks + splitkv_capacity - 1) / splitkv_capacity;
+  // Admit the pipelined backbone at half an SM wave, then compare complete
+  // waves. Its 32-head CTA has one resident block/SM; the split-KV CTA has two
+  // except for four compute warps. The measured unsplit wave-cost ratio is 4/3.
+  // This accounts for the backbone's second-wave step instead of assuming
+  // that more queries always favor it. There is no runtime GPU timing/readback.
+  if (decode_tasks * 2 >= sm_count && decode_waves * 3 <= splitkv_waves * 4)
+    return Implementation::Dsv4Fp8Decode;
+  return Implementation::Dsv4Fp8SplitKVDecode;
+}
+
+}  // namespace
+
 // Runs the existing metadata validation first; this resolver only changes scheduling.
 ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t mode, int64_t sm_count,
                                int64_t max_shared) {
@@ -101,42 +140,37 @@ ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t mode, int64_t
                                         size_t(m.extra_page_size) * m.extra_row_stride_bytes &&
                                     m.extra_indices_stride == size_t(m.extra_topk))))
       << "DSv4 FP8 decode requires flat inline FP8 KV, contiguous indices and H=8/16/32/64";
-  const int warps = m.heads == 64 ? 3 : std::min(m.heads / 8, 4);
-  const int latency_heads = (m.heads + warps * 8 - 1) / (warps * 8);
-  const int throughput_heads = (m.heads + 31) / 32;
-  const int64_t tasks = int64_t(m.tokens) * latency_heads;
-  // The 32-head prefill CTA uses one SM; the smaller decode CTA can reside
-  // twice per SM except for the four-compute-warp specialization. Model whole
-  // waves so crossing the prefill grid boundary does not select a slower path.
-  // The measured unsplit decode/prefill wave-cost ratio is approximately 4/3.
-  const int resident_decode = warps == 4 ? 1 : 2;
-  const int64_t prefill_tasks = int64_t(m.tokens) * throughput_heads;
-  const int64_t prefill_waves = (prefill_tasks + sm_count - 1) / sm_count;
-  const int64_t decode_capacity = sm_count * resident_decode;
-  const int64_t decode_waves = (tasks + decode_capacity - 1) / decode_capacity;
-  const bool throughput = mode == 2 || (mode == 0 && prefill_tasks * 2 >= sm_count &&
-                                        prefill_waves * 3 <= decode_waves * 4);
-  p.implementation =
-      throughput ? Implementation::Dsv4Fp8Decode : Implementation::Dsv4Fp8SplitKVDecode;
-  p.metadata.variant = throughput ? 1 : 0;
-  p.head_blocks = throughput ? throughput_heads : latency_heads;
-  const int tiles = (m.topk + 31) / 32 + (m.extra_topk + 31) / 32;
-  int splits = 1;
-  while (splits < 8 && tasks * splits * 2 <= decode_capacity) splits *= 2;
-  p.active_splits = throughput ? 1 : std::max(1, std::min(splits, tiles));
-  p.chunk_capacity = p.scratch_split_stride = p.active_splits;
+  p.implementation = get_implementation(m, mode, sm_count);
   p.scratch_heads = m.heads;
-  p.merge = Merge::Direct;  // Split finalization is inside the attention launch.
+  p.merge = Merge::Direct;  // Neither implementation launches a separate merge.
   p.cpb = 0;
-  p.block_threads = throughput ? 384 : (warps + 1) * 32;
-  p.shared_bytes = throughput   ? sizeof(cute_prefill::integrated::Shared)
-                   : warps == 1 ? sizeof(dsv4_fp8_splitkv_decode::Shared<1>)
-                   : warps == 2 ? sizeof(dsv4_fp8_splitkv_decode::Shared<2>)
-                   : warps == 3 ? sizeof(dsv4_fp8_splitkv_decode::Shared<3>)
-                                : sizeof(dsv4_fp8_splitkv_decode::Shared<4>);
-  const size_t slots = p.active_splits > 1 ? size_t(m.tokens) * m.heads * p.active_splits : 0;
-  p.partial_bytes = slots * 512 * sizeof(bf16);
-  p.lse_bytes = slots * sizeof(float);
+  if (p.implementation == Implementation::Dsv4Fp8Decode) {
+    p.metadata.variant = 1;
+    p.head_blocks = (m.heads + 31) / 32;
+    p.active_splits = 1;
+    p.block_threads = 384;
+    p.shared_bytes = sizeof(cute_prefill::integrated::Shared);
+    p.partial_bytes = 0;
+    p.lse_bytes = 0;
+  } else {
+    const int warps = splitkv_compute_warps(m.heads);
+    p.metadata.variant = 0;
+    p.head_blocks = (m.heads + warps * 8 - 1) / (warps * 8);
+    const int64_t tasks = int64_t(m.tokens) * p.head_blocks;
+    const int64_t capacity = sm_count * (warps == 4 ? 1 : 2);
+    const int tiles = (m.topk + 31) / 32 + (m.extra_topk + 31) / 32;
+    // Portable clusters have at most eight CTAs. Cap the power-of-two choice
+    // by live tile capacity; actual device lengths can still make chunks empty.
+    int splits = 1;
+    while (splits < 8 && tasks * splits * 2 <= capacity) splits *= 2;
+    p.active_splits = std::max(1, std::min(splits, tiles));
+    p.block_threads = (warps + 1) * 32;
+    p.shared_bytes = splitkv_shared_bytes(warps);
+    const size_t slots = p.active_splits > 1 ? size_t(m.tokens) * m.heads * p.active_splits : 0;
+    p.partial_bytes = slots * 512 * sizeof(bf16);
+    p.lse_bytes = slots * sizeof(float);
+  }
+  p.chunk_capacity = p.scratch_split_stride = p.active_splits;
   TVM_FFI_ICHECK_LE(p.shared_bytes, max_shared);
   return pack_plan(p);
 }
