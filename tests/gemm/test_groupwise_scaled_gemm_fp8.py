@@ -265,16 +265,22 @@ def test_fp8_groupwise_gemm_auto(m, n, k, scale_major_mode):
     assert picked == ("cute-dsl" if expect_cute_dsl else "cutlass")
 
 
-@pytest.mark.parametrize("m", [1, 4, 16, 32])
+@pytest.mark.parametrize(
+    "m", [1, 4, 16, 24, 32, 33, 48, 64, 65, 96, 97, 100, 124, 127, 129, 132]
+)
 @pytest.mark.parametrize("n", [128, 256])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cutlass", "cutile"])
-def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend):
+def test_fp8_groupwise_gemm_small_batch_size(
+    m, n, k, scale_major_mode, out_dtype, backend
+):
+    """Verify small-M groupwise FP8 GEMM accuracy and run-to-run determinism across swap-AB tiles."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
+    if compute_capability[0] not in [10, 12]:
         pytest.skip(
-            "Small-batch gemm_fp8_nt_groupwise dispatch is only relevant on SM100/103."
+            "Small-batch gemm_fp8_nt_groupwise dispatch is only relevant on SM100/103 and SM120/121."
         )
     cc = compute_capability[0] * 10 + compute_capability[1]
     if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
@@ -287,9 +293,10 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend)
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
+    elif compute_capability[0] == 10 and m % 4 != 0:
+        pytest.skip("SM100 CUTLASS groupwise GEMM requires M to be a multiple of 4.")
     torch.random.manual_seed(0)
     tile_size = 128
-    out_dtype = torch.bfloat16
 
     a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
     b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
@@ -320,6 +327,143 @@ def test_fp8_groupwise_gemm_small_batch_size(m, n, k, scale_major_mode, backend)
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+    c_repeat = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend=backend,
+    )
+    assert torch.equal(c, c_repeat)
+
+
+@pytest.mark.parametrize(
+    "m,n",
+    [
+        (112, 10240),  # 1 * 80 == 80 tiles -> TileN=64 partial tile
+        (112, 14336),  # 1 * 112 == 112 tiles -> 128x128x128 partial tile
+        (128, 10240),  # 1 * 80 == 80 tiles -> TileN=64
+        (128, 10368),  # 1 * 81 == 81 tiles -> 128x128x128
+        (132, 5120),  # 2 * 40 == 80 tiles, m % 4 == 0 -> TileN=64 partial tile
+        (129, 5120),  # 2 * 40 == 80 tiles, m % 4 != 0 -> 128x128x128 partial tile
+        (256, 5120),  # 2 * 40 == 80 tiles -> TileN=64
+        (256, 5248),  # 2 * 41 == 82 tiles -> 128x128x128
+    ],
+)
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_fp8_groupwise_gemm_sm120_dispatch_boundaries(
+    m, n, scale_major_mode, out_dtype
+):
+    """Verify SM120 80-tile threshold transition and alignment boundaries."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("SM120-specific dispatch boundary test.")
+
+    torch.random.manual_seed(0)
+    k = 256
+    tile_size = 128
+    a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+    if scale_major_mode == "K":
+        a_scale_shape = (m, k // tile_size)
+        b_scale_shape = (n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (k // tile_size, m)
+        b_scale_shape = (k // tile_size, n // tile_size)
+
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, (1, tile_size), scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, (tile_size, tile_size), scale_major_mode
+    )
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
+
+    c = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutlass",
+    )
+    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+    c_repeat = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutlass",
+    )
+    assert torch.equal(c, c_repeat)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,n,k,granularity",
+    [
+        (0, 128, 256, (1, 128, 128)),
+        (4, 128, 0, (1, 128, 128)),  # LowLatency TileN=32 zero-K
+        (112, 128, 0, (1, 128, 128)),  # LowLatency TileN=64 zero-K
+        (256, 5248, 0, (1, 128, 128)),  # 128x128x128 zero-K
+        (128, 128, 0, (128, 128, 128)),  # blockscale 128x128x128 zero-K
+    ],
+)
+def test_fp8_groupwise_gemm_sm120_zero_dimensions(m, n, k, granularity, out_dtype):
+    """Verify zero-M and zero-K handling zeroes nonempty outputs on SM120."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("SM120-specific zero-dimension test.")
+
+    a_fp8 = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    b_fp8 = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="cuda")
+    a_scale = torch.empty(
+        (k // 128, m if granularity[0] == 1 else max(1, m // 128)),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    b_scale = torch.empty((k // 128, n // 128), dtype=torch.float32, device="cuda")
+    out_alloc = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        "MN",
+        scale_granularity_mnk=granularity,
+        out_dtype=out_dtype,
+        backend="cutlass",
+    )
+    assert out_alloc.shape == (m, n)
+    if m > 0 and n > 0:
+        assert torch.all(out_alloc == 0)
+
+    out = torch.full((m, n), 7.0, dtype=out_dtype, device="cuda")
+    res = gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        "MN",
+        scale_granularity_mnk=granularity,
+        out=out,
+        out_dtype=out_dtype,
+        backend="cutlass",
+    )
+    assert res.shape == (m, n)
+    if m > 0 and n > 0:
+        assert torch.all(res == 0)
 
 
 @pytest.mark.parametrize("backend", ["trtllm", "cutile"])
