@@ -125,8 +125,8 @@ def resolve_execution(
         and (impl != "auto" or selected is None)
     ):
         sm, shared = device_caps(device)
-        return get_sparse_mla_sm120_module().resolve_cute_attention(
-            m, {"auto": 0, "low-latency": 1, "high-throughput": 2}[impl], sm, shared
+        return get_sparse_mla_sm120_module().resolve_decode_attention(
+            m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
         )
     if is_dsv4_nvfp4:
         from ._dsv4_nvfp4_policy import (
@@ -404,8 +404,8 @@ def wrapper_run(
     from ._execution import check_inline_scale_caches
     from ._execution import resolve_model_type as _resolve_model_type
 
-    if impl not in ("auto", "low-latency", "high-throughput"):
-        raise ValueError("impl must be auto, low-latency, or high-throughput")
+    if impl not in ("auto", "decode-splitkv", "decode"):
+        raise ValueError("impl must be auto, decode-splitkv, or decode")
     if impl != "auto" and prefill_impl not in (None, "auto"):
         raise ValueError("impl and prefill_impl cannot both override scheduling")
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"

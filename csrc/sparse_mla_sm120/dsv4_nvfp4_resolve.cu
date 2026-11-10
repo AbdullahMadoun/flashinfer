@@ -69,9 +69,9 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
   const size_t slots = merge == Merge::Direct ? 0 : size_t(tokens) * heads * active;
   return {
       NumericRoute::NVFP4,
-      streaming_prefill ? Implementation::Dsv4Nvfp4Prefill
-      : grouped         ? Implementation::Dsv4Nvfp4GroupedDecode
-                        : Implementation::Dsv4Nvfp4Decode,
+      streaming_prefill ? Implementation::Dsv4Nvfp4Decode
+      : grouped         ? Implementation::Dsv4Nvfp4GroupedSplitKVDecode
+                        : Implementation::Dsv4Nvfp4SplitKVDecode,
       cpb,
       chunks,
       active,

@@ -30,10 +30,10 @@ def main():
         f = decode_fixture(batch)
         functions = {
             impl: lambda impl=impl: call(f, impl)
-            for impl in ("auto", "low-latency", "high-throughput")
+            for impl in ("auto", "decode-splitkv", "decode")
         }
-        functions["low-latency-unfused"] = lambda: call(f, "low-latency", False)
-        functions["high-throughput-unfused"] = lambda: call(f, "high-throughput", False)
+        functions["decode-splitkv-unfused"] = lambda: call(f, "decode-splitkv", False)
+        functions["decode-unfused"] = lambda: call(f, "decode", False)
         graphs = {}
         metrics = {}
         for name, fn in functions.items():

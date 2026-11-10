@@ -6,7 +6,7 @@
 #include <cute/atom/mma_traits_sm120.hpp>
 #include <cutlass/pipeline/sm90_pipeline.hpp>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/common.cuh>
-namespace flashinfer::sparse_mla_sm120::cute_decode {
+namespace flashinfer::sparse_mla_sm120::dsv4_fp8_splitkv_decode {
 using namespace cute_prefill;
 struct Params : cute_prefill::Params {
   bf16* bf16_output;
@@ -438,4 +438,4 @@ __global__ __launch_bounds__((Warps + 1) * 32, 1) void decode(Params p) {
     }
   }
 }
-}  // namespace flashinfer::sparse_mla_sm120::cute_decode
+}  // namespace flashinfer::sparse_mla_sm120::dsv4_fp8_splitkv_decode

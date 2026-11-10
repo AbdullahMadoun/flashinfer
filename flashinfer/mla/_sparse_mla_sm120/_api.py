@@ -1077,9 +1077,9 @@ class _SparseMLAPagedAttentionRunner:
         is rounded to BF16 before FP32 inverse RoPE and FP8 quantization.
         The caller handles Q normalization and learned projections.
 
-        ``impl="auto"`` selects the CuTe split-KV low-latency or pipelined
-        high-throughput implementation by head-task parallelism / SM count.
-        Explicit ``"low-latency"`` and ``"high-throughput"`` require inline
+        ``impl="auto"`` selects the CuTe split-KV decode-splitkv or pipelined
+        decode implementation by head-task parallelism / SM count.
+        Explicit ``"decode-splitkv"`` and ``"decode"`` require inline
         FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64.
 
         Requires backend="sparse"; full-BF16 attention plans are unsupported.
@@ -1159,8 +1159,8 @@ class _SparseMLAPagedAttentionRunner:
         via ``mid_out``/``mid_lse`` when given, otherwise buffers cached on
         the runner.
 
-        ``impl`` accepts ``"auto"`` (default), ``"low-latency"`` or
-        ``"high-throughput"``. For flat inline FP8 KV with H=8/16/32/64,
+        ``impl`` accepts ``"auto"`` (default), ``"decode-splitkv"`` or
+        ``"decode"``. For flat inline FP8 KV with H=8/16/32/64,
         auto selects by query/head-task parallelism relative to SM count.
         Explicit choices require this format and cannot be combined with a
         ``prefill_impl`` override. Other formats retain their existing auto policy.
@@ -1177,8 +1177,8 @@ class _SparseMLAPagedAttentionRunner:
         ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
         query axis is normalized before planning and launch.
         """
-        if impl not in ("auto", "low-latency", "high-throughput"):
-            raise ValueError("impl must be auto, low-latency, or high-throughput")
+        if impl not in ("auto", "decode-splitkv", "decode"):
+            raise ValueError("impl must be auto, decode-splitkv, or decode")
         if self._backend != "sparse" and impl != "auto":
             raise ValueError("impl overrides require backend='sparse'")
         if self._backend == "cake" and self._kv_cache_format == "fp8":

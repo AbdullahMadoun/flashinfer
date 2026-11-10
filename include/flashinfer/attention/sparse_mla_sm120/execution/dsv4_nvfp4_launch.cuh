@@ -22,7 +22,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
   constexpr int GROUPED_H_BLOCKS =
       (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
   constexpr int UNGROUPED_H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
-  const bool use_grouped = plan.implementation == execution::Implementation::Dsv4Nvfp4GroupedDecode;
+  const bool use_grouped =
+      plan.implementation == execution::Implementation::Dsv4Nvfp4GroupedSplitKVDecode;
   const int chunks_per_block = plan.cpb;
   const int active_splits = plan.active_splits;
   const bool stage1_only = plan.merge == execution::Merge::Stage1;

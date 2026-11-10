@@ -1,17 +1,17 @@
 # SM120 sparse MLA decode scheduling
 
 `SparseMLASm120Wrapper.run` and `run_mega` accept
-`impl="auto"`, `"low-latency"`, or `"high-throughput"`. The default is `auto`.
+`impl="auto"`, `"decode-splitkv"`, or `"decode"`. The default is `auto`.
 Explicit choices require inline FP8 KV with UE8M0 scales per 32 features,
 FP8 QK arithmetic, flat cache rows, contiguous sparse indices, D=512 and
 H in {8, 16, 32, 64}. Other formats retain their existing automatic dispatch.
 Saved calibration profiles remain applicable to `auto`.
 An explicit `prefill_impl` override cannot be combined with an explicit `impl`.
 
-The high-throughput choice directly launches the CuTe C++ FP8 prefill kernel.
+The decode choice directly launches the CuTe C++ FP8 prefill kernel.
 It does not copy or fork that implementation. One CTA handles one query and
 up to 32 heads, with independent K/V producers, QK consumers and softmax/PV
-consumers. The low-latency choice uses one KV producer warp and compute warps
+consumers. The decode-splitkv choice uses one KV producer warp and compute warps
 that each handle eight heads. Each compute warp performs QK, online softmax
 and PV in order. Independent CTAs process selected-KV chunks when the head-task
 grid is too small to occupy the GPU. This is local split-KV, not multi-device
@@ -33,8 +33,8 @@ KV packing, and sparse-index construction remain outside this launch.
 
 Implementation locations:
 
-- `kernels/cute_decode/decode_fp8.cuh`: low-latency compute and cluster finalization.
-- `kernels/cute_prefill/prefill_fp8.cuh`: shared high-throughput backbone.
+- `kernels/dsv4_fp8_splitkv_decode.cuh`: decode-splitkv compute and cluster finalization.
+- `kernels/cute_prefill/prefill_fp8.cuh`: shared decode backbone.
 - `csrc/sparse_mla_sm120/cute_decode_dispatch.cu`: native planning and launches.
 - `flashinfer/mla/_sparse_mla_sm120/_prepared.py`: validation and cached preparation.
 

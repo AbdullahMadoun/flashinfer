@@ -13,12 +13,12 @@ from tests.attention.sparse_mla_prefill_utils import (
 )
 
 
-@pytest.mark.parametrize("impl", ["auto", "low-latency", "high-throughput"])
+@pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
 @pytest.mark.parametrize(
     "tokens,heads", [(1, 8), (7, 16), (7, 32), (7, 64), (28, 64), (98, 64)]
 )
 @pytest.mark.parametrize("ragged", [False, True])
-def test_cute_decode_math_and_fusion(impl, tokens, heads, ragged):
+def test_decode_math_and_fusion(impl, tokens, heads, ragged):
     f = fixture(tokens, heads, "v41_fp8", ragged=ragged)
     lse = call(f, impl)
     metric = numerical_metrics(f, lse)
@@ -39,9 +39,9 @@ def test_cute_decode_math_and_fusion(impl, tokens, heads, ragged):
         torch.testing.assert_close(a, b, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("impl", ["low-latency", "high-throughput", "auto"])
+@pytest.mark.parametrize("impl", ["decode-splitkv", "decode", "auto"])
 @pytest.mark.parametrize("empty", ["lengths", "indices"])
-def test_cute_decode_empty_and_mutable_graph(impl, empty):
+def test_decode_empty_and_mutable_graph(impl, empty):
     f = fixture(7, 64, "v41_fp8", with_sink=False)
     lse = call(f, impl)
     graph = torch.cuda.CUDAGraph()
@@ -71,23 +71,25 @@ def test_cute_decode_empty_and_mutable_graph(impl, empty):
 
 
 @pytest.mark.parametrize("bad", ["invalid", "LOW-LATENCY", None])
-def test_cute_decode_invalid_impl(bad):
+def test_decode_invalid_impl(bad):
     f = fixture(7, 64, "v41_fp8")
     with pytest.raises(ValueError, match="impl"):
         call(f, bad)
 
 
-def test_cute_decode_explicit_selection():
+def test_decode_explicit_selection():
     f = fixture(7, 64, "v41_fp8")
-    for impl in ["low-latency", "high-throughput"]:
+    for impl in ["decode-splitkv", "decode"]:
         call(f, impl)
         facts = [
             dict(p.plan.inspect())
             for key, p in f["wrapper"]._prepared_calls.items()
             if key[1] == impl
         ]
-        assert len(facts) == 1 and facts[0]["implementation"] == impl
-        if impl == "high-throughput":
+        assert len(facts) == 1 and facts[0]["implementation"] == (
+            "dsv4_fp8_splitkv_decode" if impl == "decode-splitkv" else "dsv4_fp8_decode"
+        )
+        if impl == "decode":
             assert facts[0]["partial_bytes"] == 0
 
 
@@ -125,15 +127,15 @@ def fp8_query_lse_reference(f):
     )
 
 
-@pytest.mark.parametrize("impl", ["auto", "low-latency", "high-throughput"])
-def test_cute_decode_single_cache(impl):
+@pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
+def test_decode_single_cache(impl):
     f = fixture(7, 64, "v41_fp8", extra_topk=0)
     lse = call(f, impl)
     metric = numerical_metrics(f, lse)
     assert metric["relative_l2"] < 0.07 and metric["lse_max_abs"] < 0.06
 
 
-def test_cute_decode_parallelism_policy():
+def test_decode_parallelism_policy():
     from flashinfer.mla._sparse_mla_sm120._execution import get_sparse_mla_sm120_module
     from flashinfer.mla._sparse_mla_sm120._prepared import validate_metadata
 
@@ -157,25 +159,29 @@ def test_cute_decode_parallelism_policy():
         value_dim=512,
     )
     module = get_sparse_mla_sm120_module()
-    for sms, expected in [(188, "low-latency"), (28, "high-throughput")]:
-        plan = module.resolve_cute_attention(m, 0, sms, 101376)
-        assert plan.inspect()["implementation"] == expected
+    for sms, expected in [(188, "decode-splitkv"), (28, "decode")]:
+        plan = module.resolve_decode_attention(m, 0, sms, 101376)
+        assert plan.inspect()["implementation"] == (
+            "dsv4_fp8_splitkv_decode"
+            if expected == "decode-splitkv"
+            else "dsv4_fp8_decode"
+        )
     with pytest.raises(RuntimeError):
-        module.resolve_cute_attention(m, 0, 0, 101376)
+        module.resolve_decode_attention(m, 0, 0, 101376)
 
 
 @pytest.mark.parametrize(
     "tokens,expected",
     [
-        (7, "low-latency"),
-        (49, "high-throughput"),
-        (91, "high-throughput"),
-        (98, "low-latency"),
-        (119, "low-latency"),
-        (126, "high-throughput"),
+        (7, "decode-splitkv"),
+        (49, "decode"),
+        (91, "decode"),
+        (98, "decode-splitkv"),
+        (119, "decode-splitkv"),
+        (126, "decode"),
     ],
 )
-def test_cute_decode_wave_policy(tokens, expected):
+def test_decode_wave_policy(tokens, expected):
     from flashinfer.mla._sparse_mla_sm120._execution import get_sparse_mla_sm120_module
     from flashinfer.mla._sparse_mla_sm120._prepared import validate_metadata
 
@@ -198,14 +204,16 @@ def test_cute_decode_wave_policy(tokens, expected):
         extra_fp4=False,
         value_dim=512,
     )
-    p = get_sparse_mla_sm120_module().resolve_cute_attention(
+    p = get_sparse_mla_sm120_module().resolve_decode_attention(
         m._replace(tokens=tokens), 0, 188, 101376
     )
-    assert p.inspect()["implementation"] == expected
+    assert p.inspect()["implementation"] == (
+        "dsv4_fp8_splitkv_decode" if expected == "decode-splitkv" else "dsv4_fp8_decode"
+    )
 
 
-@pytest.mark.parametrize("impl", ["low-latency", "high-throughput"])
-def test_cute_decode_single_kernel_boundary(impl, tmp_path):
+@pytest.mark.parametrize("impl", ["decode-splitkv", "decode"])
+def test_decode_single_kernel_boundary(impl, tmp_path):
     import re
 
     f = fixture(7, 64, "v41_fp8")
@@ -220,4 +228,6 @@ def test_cute_decode_single_kernel_boundary(impl, tmp_path):
     graph.debug_dump(str(path))
     nodes = re.findall(r'"graph_\d+_node_\d+"\[.*?\];', path.read_text(), re.DOTALL)
     assert len(nodes) == 1 and 'label="{KERNEL' in nodes[0], nodes
-    assert ("cute_decode" if impl == "low-latency" else "cute_prefill") in nodes[0]
+    assert (
+        "dsv4_fp8_splitkv_decode" if impl == "decode-splitkv" else "cute_prefill"
+    ) in nodes[0]

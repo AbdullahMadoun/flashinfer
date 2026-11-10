@@ -81,15 +81,15 @@ class AttentionPlanObj : public ffi::ModuleObj {
         const char* implementation[] = {"ordinary",
                                         "mixed",
                                         "full_bf16",
-                                        "dsv4_nvfp4_decode",
-                                        "dsv4_nvfp4_grouped_decode",
+                                        "dsv4_nvfp4_splitkv_decode",
+                                        "dsv4_nvfp4_grouped_splitkv_decode",
                                         "sg",
                                         "mg",
                                         "fulltile",
                                         "swapab",
-                                        "dsv4_nvfp4_prefill",
-                                        "low-latency",
-                                        "high-throughput"};
+                                        "dsv4_nvfp4_decode",
+                                        "dsv4_fp8_splitkv_decode",
+                                        "dsv4_fp8_decode"};
         const char* merge[] = {"direct", "merge2", "general", "stage1"};
         return ffi::Map<ffi::String, ffi::Any>{
             {"numeric_route", ffi::String(numeric[int(plan.numeric)])},

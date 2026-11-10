@@ -12,7 +12,7 @@ cudaError_t dispatch_attention(const Dsv4Nvfp4AttentionParams& p,
 #define DISPATCH(H, K)                                                                             \
   if (plan.specialized_heads == H && plan.specialized_topk == K) {                                 \
     const bool fixed_page = p.page_size == execution::FixedPageSize;                               \
-    if (plan.implementation == execution::Implementation::Dsv4Nvfp4Prefill) {                      \
+    if (plan.implementation == execution::Implementation::Dsv4Nvfp4Decode) {                       \
       if constexpr (H % HPB == 0) {                                                                \
         if (dual)                                                                                  \
           return fixed_page                                                                        \

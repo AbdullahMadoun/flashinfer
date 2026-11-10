@@ -103,15 +103,15 @@ enum class Implementation : int64_t {
   Ordinary,
   MixedCache,
   FullBF16,
-  Dsv4Nvfp4Decode,
-  Dsv4Nvfp4GroupedDecode,
+  Dsv4Nvfp4SplitKVDecode,
+  Dsv4Nvfp4GroupedSplitKVDecode,
   SG,
   MG,
   FullTile,
   SwapAB,
-  Dsv4Nvfp4Prefill,
-  CuteLowLatency,
-  CuteHighThroughput
+  Dsv4Nvfp4Decode,
+  Dsv4Fp8SplitKVDecode,
+  Dsv4Fp8Decode
 };
 enum class Merge : int64_t { Direct, Merge2, General, Stage1 };
 

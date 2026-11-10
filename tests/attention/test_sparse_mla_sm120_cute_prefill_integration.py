@@ -100,7 +100,7 @@ def test_pitched_inline_rows_and_lse_stride():
             return_lse=True,
             lse_scale=0.6931471805599453,
             out_lse=out_lse,
-            impl="high-throughput",
+            impl="decode",
         )
 
     lse = mega()
