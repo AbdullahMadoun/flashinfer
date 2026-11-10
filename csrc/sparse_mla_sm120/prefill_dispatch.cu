@@ -63,7 +63,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
       static bool configured[32] = {};
       auto status = configure_dynamic_smem_per_device(prefill<Mega, 32, FullHeadTiles>,
                                                       sizeof(Shared), configured);
-      if (!status.supported || status.error != cudaSuccess) return status;
+      if (status != cudaSuccess) return {status, "configure_dynamic_smem_per_device"};
       prefill<Mega, 32, FullHeadTiles>
           <<<m.tokens*((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
       return {cudaGetLastError(), "CuTe sparse prefill"};

@@ -1,5 +1,6 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
+#include <flashinfer/attention/sparse_mla_sm120/execution/kernel_launch.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill_fp8.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv4_fp8_splitkv_decode.cuh>
 
@@ -47,7 +48,7 @@ cudaError_t dispatch_decode(const execution::AttentionParams& p,
     static thread_local bool configured[32] = {};
     auto status = configure_dynamic_smem_per_device(
         kernel, sizeof(dsv4_fp8_splitkv_decode::Shared<W>), configured);
-    if (!status.supported || status.error != cudaSuccess) return status.error;
+    if (status != cudaSuccess) return status;
     static thread_local bool carveout_set[32] = {};
     int device = 0;
     auto error = cudaGetDevice(&device);
