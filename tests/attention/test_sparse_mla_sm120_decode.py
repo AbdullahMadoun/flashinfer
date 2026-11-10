@@ -31,6 +31,11 @@ def test_decode_math_and_fusion(impl, tokens, heads, ragged):
     torch.testing.assert_close(
         lse.double(), fp8_query_lse_reference(f), atol=2e-5, rtol=0
     )
+    # Independent attention accuracy was checked above. This second check
+    # isolates the fusion contract: separate Q RoPE -> the same attention core
+    # -> inverse output RoPE/FP8 must match the fused composition, including
+    # BF16 rounding boundaries and output scales. It is not an independent
+    # attention oracle, because the fused and separate paths share that core.
     expected = [x.clone() for x in (f["out"].view(torch.uint8), f["scales"], lse)]
     lse = call(f, impl, False)
     for a, b in zip(

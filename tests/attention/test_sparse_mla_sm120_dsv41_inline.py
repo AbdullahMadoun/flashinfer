@@ -297,12 +297,19 @@ def _inline_view(footer: torch.Tensor, fmt, span: int, pitch: int = 0) -> torch.
     return view
 
 
-def _assert_decode_against_reference(
+def _assert_inline_and_footer_decode_accuracy(
     actual, footer_output, q, cache, indices, extra_cache=None, extra_indices=None
 ):
-    # The new inline scheduler uses 32-candidate P quantization and different
-    # split boundaries from footer decode. Cache layouts remain byte-exact,
-    # but attention outputs need an independent numerical reference.
+    """Check both cache-layout routes against FP64 attention on the same KV.
+
+    This is a cache-addressing and numerical-accuracy test, not a fusion test.
+    The footer kernel's output is another result being checked, not the oracle.
+    Inline decode uses 32-candidate probability quantization and different KV
+    splits, so the two kernels need not produce identical BF16 rounding. Their
+    independent reference decodes the footer bytes, gathers the logical sparse
+    indices, and computes dense FP64 softmax/PV without either kernel's helpers.
+    Fused/separate-stage equivalence is covered by the decode fusion tests.
+    """
     from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1
 
     q = q.reshape(-1, q.shape[-2], 512).double()
@@ -412,7 +419,7 @@ def test_inline_attention_matches_footer(
         and main_span_pad == 0
         and extra_span_pad == 0
     ):
-        _assert_decode_against_reference(
+        _assert_inline_and_footer_decode_accuracy(
             out, ref_out, q, footer, indices, extra_footer, extra_indices
         )
         torch.testing.assert_close(lse, ref_lse, atol=2e-6, rtol=0)
@@ -591,7 +598,7 @@ def test_inline_one_row_pages_with_row_pitch_match_footer(
     )
     torch.cuda.synchronize()
     if tokens <= 64 and precision != "bf16" and extra != "fp4":
-        _assert_decode_against_reference(out, ref, q, footer, indices)
+        _assert_inline_and_footer_decode_accuracy(out, ref, q, footer, indices)
     elif tokens > 64 and precision != "bf16" and extra != "fp4":
         _assert_prefill_output_rounding(out, ref)
     else:
@@ -704,7 +711,7 @@ def test_dsv4_entry_inline_formats_match_footer(fp4, sm12x):
     if fp4:
         assert torch.equal(out, ref)
     else:
-        _assert_decode_against_reference(
+        _assert_inline_and_footer_decode_accuracy(
             out, ref, q, footer, idx, extra_footer, extra_idx
         )
 
