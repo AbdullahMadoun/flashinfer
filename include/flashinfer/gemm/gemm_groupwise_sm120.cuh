@@ -18,7 +18,9 @@
 
 #include <flashinfer/allocator.h>
 
+#include <algorithm>
 #include <cassert>
+#include <flashinfer/utils.cuh>
 #include <iostream>
 #include <iterator>
 #include <type_traits>
@@ -30,12 +32,79 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_detail.hpp"
+#include "cutlass/kernel_hardware_info.h"
 #include "cutlass/util/packed_stride.hpp"
 
 namespace flashinfer {
 namespace gemm {
 
 // SM120 uses Cooperative schedule with 128x128x128 tile shape
+namespace detail {
+
+inline cutlass::KernelHardwareInfo MakeCutlassHardwareInfo() {
+  cutlass::KernelHardwareInfo hw_info{};
+  // Query the active device ID (multi-GPU safe); SM count is process-wide homogeneous.
+  cudaGetDevice(&hw_info.device_id);
+  hw_info.sm_count = flashinfer::GetCudaMultiProcessorCount();
+  return hw_info;
+}
+
+inline bool HandleTrivialGroupwiseGemmDims(void* D_ptr, int m, int n, int k, int l,
+                                           size_t element_d_size, cudaStream_t stream,
+                                           cudaError_t& err) {
+  if (m < 0 || n < 0 || k < 0 || l < 0) {
+    err = cudaErrorInvalidValue;
+    return true;
+  }
+  if (m == 0 || n == 0 || l == 0) {
+    err = cudaSuccess;
+    return true;
+  }
+  if (k == 0) {
+    err = cudaMemsetAsync(D_ptr, 0, static_cast<size_t>(m) * n * l * element_d_size, stream);
+    return true;
+  }
+  return false;
+}
+
+template <typename Gemm>
+inline cudaError_t RunGroupwiseGemmOperator(typename Gemm::Arguments& arguments, void* float_buffer,
+                                            size_t float_buffer_size_in_bytes,
+                                            cudaStream_t stream) {
+  Gemm gemm;
+
+  cutlass::Status status = gemm.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorNotSupported;
+  }
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  if (workspace_size > float_buffer_size_in_bytes) {
+    return cudaErrorInsufficientDriver;
+  }
+
+  void* kernel_workspace = nullptr;
+  if (workspace_size > 0) {
+    kernel_workspace = float_buffer;
+  }
+
+  status = gemm.initialize(arguments, kernel_workspace, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorNotSupported;
+  }
+
+  status = gemm.run(stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+
+  return cudaSuccess;
+}
+
+}  // namespace detail
+
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
@@ -47,14 +116,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
                 "SM120/SM121 only supports ScaleGranularityM = 1 or 128");
   static_assert(ScaleGranularityN == 128, "SM120/SM121 only supports ScaleGranularityN = 128");
   static_assert(ScaleGranularityK == 128, "SM120/SM121 only supports ScaleGranularityK = 128");
-  if (m < 0 || n < 0 || k < 0 || l < 0) {
-    return cudaErrorInvalidValue;
-  }
-  if (m == 0 || n == 0 || l == 0) {
-    return cudaSuccess;
-  }
-  if (k == 0) {
-    return cudaMemsetAsync(D_ptr, 0, static_cast<size_t>(m) * n * l * sizeof(DTypeOut), stream);
+  cudaError_t trivial_err = cudaSuccess;
+  if (detail::HandleTrivialGroupwiseGemmDims(D_ptr, m, n, k, l, sizeof(DTypeOut), stream,
+                                             trivial_err)) {
+    return trivial_err;
   }
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   using namespace cute;
@@ -135,43 +200,15 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       cutlass::gemm::GemmUniversalMode::kGemm,
       {m, n, k, l},
       {A_ptr, stride_A, B_ptr, stride_B, SFA_ptr, layout_SFA, SFB_ptr, layout_SFB},
-      {{}, nullptr, stride_C, D_ptr, stride_D}};
+      {{}, nullptr, stride_C, D_ptr, stride_D},
+      detail::MakeCutlassHardwareInfo()};
 
   // Set alpha and beta for the epilogue
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
 
-  Gemm gemm;
-
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorNotSupported;
-  }
-
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  if (workspace_size > float_buffer_size_in_bytes) {
-    return cudaErrorInsufficientDriver;
-  }
-
-  // Pass workspace pointer only if needed
-  void* kernel_workspace = nullptr;
-  if (workspace_size > 0) {  // Only provide a pointer if workspace is actually needed
-    kernel_workspace = float_buffer;
-  }
-
-  status = gemm.initialize(arguments, kernel_workspace);
-  if (status != cutlass::Status::kSuccess) {
-    // Don't continue if initialization failed
-    return cudaErrorNotSupported;
-  }
-
-  status = gemm.run(stream);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorUnknown;
-  }
-
-  return cudaSuccess;
+  return detail::RunGroupwiseGemmOperator<Gemm>(arguments, float_buffer, float_buffer_size_in_bytes,
+                                                stream);
 #else
   return cudaErrorNotSupported;
 #endif
@@ -180,30 +217,24 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 // Low-latency swap-AB kernel for small M (e.g., decode / small-batch prefill):
 // Computes D^T = B * A^T with shape (n, m, k, l) and ColumnMajor output layout,
 // which has the exact same memory layout as RowMajor D of shape (m, n, l).
-// Placing M on the MMA N-axis enables narrow TileN (32 or 64), reducing per-stage
+// Placing M on the MMA N-axis enables narrow TileN (32, 64, or 96), reducing per-stage
 // shared memory to (128 + TileN) * 128 bytes and eliminating CTA row padding waste.
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          int TileN, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(void* float_buffer,
-                                                      size_t float_buffer_size_in_bytes,
-                                                      DTypeIn* A_ptr, DTypeIn* B_ptr,
-                                                      float* SFA_ptr, float* SFB_ptr,
-                                                      DTypeOut* D_ptr, int m, int n, int k, int l,
-                                                      cudaStream_t stream) {
+          int TileN, bool UseStreamK = false, typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(
+    void* float_buffer, size_t float_buffer_size_in_bytes, DTypeIn* A_ptr, DTypeIn* B_ptr,
+    float* SFA_ptr, float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k, int l,
+    cudaStream_t stream, int splits = 1, bool force_stream_k = false) {
   static_assert(ScaleGranularityM == 1,
                 "SM120 low-latency swap-AB kernel requires ScaleGranularityM = 1");
   static_assert(ScaleGranularityN == 128, "SM120/SM121 only supports ScaleGranularityN = 128");
   static_assert(ScaleGranularityK == 128, "SM120/SM121 only supports ScaleGranularityK = 128");
-  static_assert(TileN == 32 || TileN == 64,
-                "SM120 low-latency swap-AB kernel only supports TileN = 32 or 64");
-  if (m < 0 || n < 0 || k < 0 || l < 0) {
-    return cudaErrorInvalidValue;
-  }
-  if (m == 0 || n == 0 || l == 0) {
-    return cudaSuccess;
-  }
-  if (k == 0) {
-    return cudaMemsetAsync(D_ptr, 0, static_cast<size_t>(m) * n * l * sizeof(DTypeOut), stream);
+  static_assert(TileN == 32 || TileN == 64 || TileN == 96,
+                "SM120 low-latency swap-AB kernel only supports TileN = 32, 64, or 96");
+  cudaError_t trivial_err = cudaSuccess;
+  if (detail::HandleTrivialGroupwiseGemmDims(D_ptr, m, n, k, l, sizeof(DTypeOut), stream,
+                                             trivial_err)) {
+    return trivial_err;
   }
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
   using namespace cute;
@@ -258,9 +289,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(void* float_buffer,
       AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK, StageCount,
       cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
+  using TileScheduler = cute::conditional_t<UseStreamK, cutlass::gemm::StreamKScheduler, void>;
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
-                                           CollectiveEpilogue, void>;
+                                           CollectiveEpilogue, TileScheduler>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -281,35 +313,21 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(void* float_buffer,
       cutlass::gemm::GemmUniversalMode::kGemm,
       {n, m, k, l},
       {B_ptr, stride_A, A_ptr, stride_B, SFB_ptr, layout_SFA, SFA_ptr, layout_SFB},
-      {{}, nullptr, stride_C, D_ptr, stride_D}};
-
-  arguments.epilogue.thread.alpha = 1.0f;
-  arguments.epilogue.thread.beta = 0.0f;
-
-  Gemm gemm;
-
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorNotSupported;
+      {{}, nullptr, stride_C, D_ptr, stride_D},
+      detail::MakeCutlassHardwareInfo()};
+  if constexpr (UseStreamK) {
+    arguments.scheduler.splits = std::max(1, splits);
+    if (force_stream_k) {
+      arguments.scheduler.decomposition_mode =
+          cutlass::gemm::kernel::detail::DecompositionMode::StreamK;
+    } else if (arguments.scheduler.splits > 1) {
+      arguments.scheduler.decomposition_mode =
+          cutlass::gemm::kernel::detail::DecompositionMode::SplitK;
+    }
   }
 
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  if (workspace_size > float_buffer_size_in_bytes) {
-    return cudaErrorInsufficientDriver;
-  }
-
-  void* kernel_workspace = (workspace_size > 0) ? float_buffer : nullptr;
-  status = gemm.initialize(arguments, kernel_workspace);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorNotSupported;
-  }
-
-  status = gemm.run(stream);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorUnknown;
-  }
-
-  return cudaSuccess;
+  return detail::RunGroupwiseGemmOperator<Gemm>(arguments, float_buffer, float_buffer_size_in_bytes,
+                                                stream);
 #else
   return cudaErrorNotSupported;
 #endif

@@ -339,33 +339,48 @@ def test_fp8_groupwise_gemm_small_batch_size(
     assert torch.equal(c, c_repeat)
 
 
-@pytest.mark.parametrize(
-    "m,n",
-    [
-        (112, 10240),  # 1 * 80 == 80 tiles -> TileN=64 partial tile
-        (112, 14336),  # 1 * 112 == 112 tiles -> 128x128x128 partial tile
-        (128, 10240),  # 1 * 80 == 80 tiles -> TileN=64
-        (128, 10368),  # 1 * 81 == 81 tiles -> 128x128x128
-        (132, 5120),  # 2 * 40 == 80 tiles, m % 4 == 0 -> TileN=64 partial tile
-        (129, 5120),  # 2 * 40 == 80 tiles, m % 4 != 0 -> 128x128x128 partial tile
-        (256, 5120),  # 2 * 40 == 80 tiles -> TileN=64
-        (256, 5248),  # 2 * 41 == 82 tiles -> 128x128x128
-    ],
-)
-@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-def test_fp8_groupwise_gemm_sm120_dispatch_boundaries(
-    m, n, scale_major_mode, out_dtype
-):
-    """Verify SM120 80-tile threshold transition and alignment boundaries."""
+def _require_sm120():
     if not torch.cuda.is_available():
         pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 12:
-        pytest.skip("SM120-specific dispatch boundary test.")
+        pytest.skip("SM120-specific test.")
 
+
+def _quantize_fp8_with_dtype(
+    x: torch.Tensor,
+    scale_shape,
+    tile_shape,
+    scale_major_mode: str,
+    fp8_dtype: torch.dtype,
+):
+    if fp8_dtype == torch.float8_e4m3fn:
+        return quantize_fp8(x, scale_shape, tile_shape, scale_major_mode)
+    _, x_scale = quantize_fp8(x, scale_shape, tile_shape, scale_major_mode)
+    ratio = torch.finfo(torch.float8_e4m3fn).max / torch.finfo(fp8_dtype).max
+    x_scale = x_scale * ratio
+    tile_m, tile_k = tile_shape
+    if scale_major_mode == "K":
+        s = x_scale.repeat_interleave(tile_m, dim=0).repeat_interleave(tile_k, dim=1)
+    else:
+        s = (
+            x_scale.t()
+            .repeat_interleave(tile_m, dim=0)
+            .repeat_interleave(tile_k, dim=1)
+        )
+    return (x / (s + 1e-8)).to(fp8_dtype), x_scale
+
+
+def _run_sm120_fp8_case(
+    m: int,
+    n: int,
+    k: int,
+    scale_major_mode: str,
+    out_dtype: torch.dtype,
+    in_dtype: torch.dtype = torch.float8_e4m3fn,
+    stream: torch.cuda.Stream | None = None,
+):
     torch.random.manual_seed(0)
-    k = 256
     tile_size = 128
     a_val = torch.randn((m, k), dtype=torch.float, device="cuda")
     b_val = torch.randn((n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
@@ -376,36 +391,91 @@ def test_fp8_groupwise_gemm_sm120_dispatch_boundaries(
         a_scale_shape = (k // tile_size, m)
         b_scale_shape = (k // tile_size, n // tile_size)
 
-    a_fp8, a_scale = quantize_fp8(
-        a_val, a_scale_shape, (1, tile_size), scale_major_mode
+    a_fp8, a_scale = _quantize_fp8_with_dtype(
+        a_val, a_scale_shape, (1, tile_size), scale_major_mode, in_dtype
     )
-    b_fp8, b_scale = quantize_fp8(
-        b_val, b_scale_shape, (tile_size, tile_size), scale_major_mode
+    b_fp8, b_scale = _quantize_fp8_with_dtype(
+        b_val, b_scale_shape, (tile_size, tile_size), scale_major_mode, in_dtype
     )
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
     ref_c = einsum(a_dequant, b_dequant, "m k, n k -> m n").to(out_dtype)
 
-    c = gemm_fp8_nt_groupwise(
-        a_fp8,
-        b_fp8,
-        a_scale,
-        b_scale,
-        scale_major_mode,
-        out_dtype=out_dtype,
-        backend="cutlass",
-    )
-    torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
-    c_repeat = gemm_fp8_nt_groupwise(
-        a_fp8,
-        b_fp8,
-        a_scale,
-        b_scale,
-        scale_major_mode,
-        out_dtype=out_dtype,
-        backend="cutlass",
-    )
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            c = gemm_fp8_nt_groupwise(
+                a_fp8,
+                b_fp8,
+                a_scale,
+                b_scale,
+                scale_major_mode,
+                out_dtype=out_dtype,
+                backend="cutlass",
+            )
+            c_repeat = gemm_fp8_nt_groupwise(
+                a_fp8,
+                b_fp8,
+                a_scale,
+                b_scale,
+                scale_major_mode,
+                out_dtype=out_dtype,
+                backend="cutlass",
+            )
+        stream.synchronize()
+    else:
+        c = gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            out_dtype=out_dtype,
+            backend="cutlass",
+        )
+        c_repeat = gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            out_dtype=out_dtype,
+            backend="cutlass",
+        )
+    tol = 2e-2 if in_dtype == torch.float8_e5m2 else 1e-2
+    torch.testing.assert_close(c, ref_c, atol=tol, rtol=tol)
     assert torch.equal(c, c_repeat)
+    return a_fp8, b_fp8, a_scale, b_scale, ref_c
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        # Small-K persistent transitions & unaligned partial tiles (32, 64, 96, 128)
+        (33, 10240, 256),
+        (112, 10240, 256),
+        (112, 14336, 256),
+        (129, 5120, 256),
+        (256, 5120, 256),
+        (257, 5120, 256),
+        (384, 14336, 256),
+        (385, 5120, 256),
+        # Large-K Stream-K / Split-K underfill & wave boundaries (TileN=32/64)
+        (17, 512, 2048),  # tiny grid -> TileN=32 Stream-K
+        (97, 1536, 8192),  # unaligned M > 96, deep-K -> TileN=32 Split-K
+        (112, 1536, 2048),  # underfill M > 96 -> TileN=32 Split-K
+        (161, 2560, 2048),  # medium-M underfill -> TileN=64 Split-K
+        (384, 2560, 2048),  # >sm/2 underfill -> TileN=64 forced Stream-K
+    ],
+)
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_fp8_groupwise_gemm_sm120_dispatch_boundaries(
+    m, n, k, scale_major_mode, out_dtype
+):
+    """Verify SM120 dispatch transitions across persistent, Stream-K, Split-K, and partial tiles."""
+    _require_sm120()
+    _run_sm120_fp8_case(m, n, k, scale_major_mode, out_dtype)
 
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
@@ -413,19 +483,17 @@ def test_fp8_groupwise_gemm_sm120_dispatch_boundaries(
     "m,n,k,granularity",
     [
         (0, 128, 256, (1, 128, 128)),
-        (4, 128, 0, (1, 128, 128)),  # LowLatency TileN=32 zero-K
-        (112, 128, 0, (1, 128, 128)),  # LowLatency TileN=64 zero-K
-        (256, 5248, 0, (1, 128, 128)),  # 128x128x128 zero-K
+        (16, 0, 256, (1, 128, 128)),
+        (4, 128, 0, (1, 128, 128)),  # small-M zero-K
+        (112, 128, 0, (1, 128, 128)),  # medium-M zero-K
+        (384, 128, 0, (1, 128, 128)),  # multi-tile-M zero-K
+        (385, 5248, 0, (1, 128, 128)),  # 128x128x128 zero-K
         (128, 128, 0, (128, 128, 128)),  # blockscale 128x128x128 zero-K
     ],
 )
 def test_fp8_groupwise_gemm_sm120_zero_dimensions(m, n, k, granularity, out_dtype):
-    """Verify zero-M and zero-K handling zeroes nonempty outputs on SM120."""
-    if not torch.cuda.is_available():
-        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 12:
-        pytest.skip("SM120-specific zero-dimension test.")
+    """Verify zero-M/N and zero-K handling zeroes nonempty outputs on SM120."""
+    _require_sm120()
 
     a_fp8 = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
     b_fp8 = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="cuda")
@@ -464,6 +532,137 @@ def test_fp8_groupwise_gemm_sm120_zero_dimensions(m, n, k, granularity, out_dtyp
     assert res.shape == (m, n)
     if m > 0 and n > 0:
         assert torch.all(res == 0)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (17, 512, 2048),  # TileN=32 Stream-K e5m2
+        (132, 5120, 256),  # TileN=64 Persistent e5m2
+        (161, 2560, 2048),  # TileN=64 Split-K e5m2
+        (384, 5120, 256),  # TileN=96 Persistent e5m2
+    ],
+)
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_fp8_groupwise_gemm_sm120_e5m2(m, n, k, scale_major_mode, out_dtype):
+    """Verify SM120 swap-AB and Stream-K/Split-K kernels with e5m2 inputs."""
+    _require_sm120()
+    _run_sm120_fp8_case(m, n, k, scale_major_mode, out_dtype, torch.float8_e5m2)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (17, 512, 2048),  # Stream-K workspace init on capture/non-default stream
+        (112, 1536, 2048),  # Split-K workspace init on capture/non-default stream
+        (384, 5120, 256),  # Persistent TileN=96
+    ],
+)
+def test_fp8_groupwise_gemm_sm120_stream_and_cuda_graph(m, n, k):
+    """Verify non-default stream ordering and CUDA graph replay on SM120."""
+    _require_sm120()
+    stream = torch.cuda.Stream()
+    a_fp8, b_fp8, a_scale, b_scale, ref_c = _run_sm120_fp8_case(
+        m, n, k, "MN", torch.bfloat16, stream=stream
+    )
+
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    # Warmup outside graph capture
+    with torch.cuda.stream(stream):
+        gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            "MN",
+            out=out,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        gemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            "MN",
+            out=out,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+    out.zero_()
+    graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
+@pytest.mark.parametrize(
+    "l,m,n,k",
+    [
+        (4, 33, 512, 2048),  # 3D BMM underfilled -> Swap-AB Split-K/Stream-K
+        (8, 256, 2048, 256),  # 3D BMM tail-smoothing -> TileN=64 Persistent
+        (16, 17, 1024, 2048),  # 3D BMM -> TileN=32 Persistent/Split-K
+    ],
+)
+def test_fp8_groupwise_gemm_sm120_bmm_and_small_workspace(l, m, n, k, scale_major_mode):
+    """Verify native 3D BMM dispatch and tiny-workspace fallback on SM120."""
+    _require_sm120()
+    from flashinfer.gemm.gemm_base import get_gemm_sm120_module
+
+    torch.random.manual_seed(0)
+    tile_size = 128
+    a_val = torch.randn((l, m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn((l, n, k), dtype=torch.float, device="cuda") / math.sqrt(k)
+
+    if scale_major_mode == "K":
+        a_scale_shape = (l, m, k // tile_size)
+        b_scale_shape = (l, n // tile_size, k // tile_size)
+    else:
+        a_scale_shape = (l, k // tile_size, m)
+        b_scale_shape = (l, k // tile_size, n // tile_size)
+
+    a_fp8, a_scale = quantize_fp8(
+        a_val, a_scale_shape, (1, 1, tile_size), scale_major_mode
+    )
+    b_fp8, b_scale = quantize_fp8(
+        b_val, b_scale_shape, (1, tile_size, tile_size), scale_major_mode
+    )
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+    ref_c = einsum(a_dequant, b_dequant, "b m k, b n k -> b m n").to(torch.bfloat16)
+
+    # Native 3D SM120 C++ binding expects B in [l, k, n] column-major
+    b_col = b_fp8.transpose(-2, -1)
+    out = torch.empty((l, m, n), dtype=torch.bfloat16, device="cuda")
+    workspace = torch.empty(4 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    module = get_gemm_sm120_module()
+    module.gemm_fp8_nt_groupwise(
+        workspace, a_fp8, b_col, a_scale, b_scale, out, 1, 128, 128, scale_major_mode
+    )
+    torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
+
+    # Also verify tiny-workspace safe fallback to persistent Swap-AB (0B workspace)
+    if l == 4:
+        tiny_ws = torch.empty(1024, dtype=torch.uint8, device="cuda")
+        out_tiny = torch.empty((l, m, n), dtype=torch.bfloat16, device="cuda")
+        module.gemm_fp8_nt_groupwise(
+            tiny_ws,
+            a_fp8,
+            b_col,
+            a_scale,
+            b_scale,
+            out_tiny,
+            1,
+            128,
+            128,
+            scale_major_mode,
+        )
+        torch.testing.assert_close(out_tiny, ref_c, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("backend", ["trtllm", "cutile"])

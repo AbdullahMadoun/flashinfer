@@ -13,7 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <algorithm>
+#include <cstddef>
 #include <flashinfer/cutlass_utils.cuh>
+#include <flashinfer/utils.cuh>
+#include <type_traits>
 
 #include "tvm_ffi_utils.h"
 
@@ -81,13 +85,137 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
                                             int l, cudaStream_t stream);
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          int TileN, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(void* float_buffer,
-                                                      size_t float_buffer_size_in_bytes,
-                                                      DTypeIn* A_ptr, DTypeIn* B_ptr,
-                                                      float* SFA_ptr, float* SFB_ptr,
-                                                      DTypeOut* C_ptr, int m, int n, int k, int l,
-                                                      cudaStream_t stream);
+          int TileN, bool UseStreamK = false, typename DTypeIn, typename DTypeOut>
+cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(
+    void* float_buffer, size_t float_buffer_size_in_bytes, DTypeIn* A_ptr, DTypeIn* B_ptr,
+    float* SFA_ptr, float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k, int l,
+    cudaStream_t stream, int splits = 1, bool force_stream_k = false);
+
+template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
+          typename DTypeIn, typename DTypeOut>
+cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_size_in_bytes,
+                                          DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
+                                          float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
+                                          int l, cudaStream_t stream) {
+  auto launch_baseline = [&]() {
+    return CutlassGroupwiseScaledGEMMSM120<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+                                           ScaleMajorK>(float_buffer, workspace_size_in_bytes,
+                                                        A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, m, n,
+                                                        k, l, stream);
+  };
+
+  if constexpr (ScaleGranularityM != 1) {
+    return launch_baseline();
+  } else {
+    if (m <= 0 || n <= 0 || k <= 0 || l <= 0) {
+      return launch_baseline();
+    }
+
+    auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+    const size_t sm = static_cast<size_t>(std::max(1, flashinfer::GetCudaMultiProcessorCount()));
+    const size_t l_nt = static_cast<size_t>(l) * ceil_div(n, 128);
+    const int kt = ceil_div(k, 128);
+
+    auto grid_for = [&](int tile_m) { return l_nt * static_cast<size_t>(ceil_div(m, tile_m)); };
+    auto waves_for = [&](size_t g) { return (g + sm - 1) / sm; };
+    auto fits_streamk_ws = [&](size_t g, int tile_n) {
+      // Deterministic Stream-K / Split-K needs 1 FP32 tile accumulator per output tile + barriers.
+      const size_t per_tile_bytes = static_cast<size_t>(128) * tile_n * sizeof(float) + 256;
+      return workspace_size_in_bytes >= (g * per_tile_bytes + 65536);
+    };
+    auto pick_split_factor = [&](size_t g) {
+      // Prefer fixed deterministic Split-K (2..4) once 4-way split occupies >= 50% of SMs.
+      if (g * 8 < sm) {
+        return 1;
+      }
+      int max_splits = std::min(4, static_cast<int>(sm / g));
+      max_splits = std::min(max_splits, kt / 12);
+      return std::max(1, max_splits);
+    };
+
+    const size_t g32 = grid_for(32);
+    const size_t g64 = grid_for(64);
+    const size_t g96 = grid_for(96);
+    const size_t g128 = grid_for(128);
+    const size_t w32 = waves_for(g32);
+    const size_t w64 = waves_for(g64);
+    const size_t w96 = waves_for(g96);
+    const size_t w128 = waves_for(g128);
+    const size_t tail128 = g128 % sm;
+
+    // 1. Underfilled GPU regime: use Swap-AB with Split-K / Stream-K to fill idle SMs.
+    if (kt >= 16) {
+      auto try_launch_stream_k = [&](auto tile_n_tag, size_t g) -> cudaError_t {
+        if (!fits_streamk_ws(g, decltype(tile_n_tag)::value)) {
+          return cudaErrorInsufficientDriver;
+        }
+        const int splits = pick_split_factor(g);
+        const bool force_sk = (splits == 1 && g > sm / 2);
+        return CutlassGroupwiseScaledGEMMSM120LowLatency<ScaleGranularityM, ScaleGranularityN,
+                                                         ScaleGranularityK, ScaleMajorK,
+                                                         decltype(tile_n_tag)::value, true>(
+            float_buffer, workspace_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, m, n, k,
+            l, stream, splits, force_sk);
+      };
+
+      const bool use_sw32_sk = (m <= 96) ? (g32 <= sm / 16) : (g32 <= sm / 2);
+      if (use_sw32_sk) {
+        const cudaError_t status = try_launch_stream_k(std::integral_constant<int, 32>{}, g32);
+        if (status != cudaErrorInsufficientDriver) {
+          return status;
+        }
+      }
+
+      const bool use_sw64_sk =
+          (m > 96) && (m <= 256 ? g64 <= sm / 2 : m <= 384 && g64 <= (sm * 2) / 3);
+      if (use_sw64_sk) {
+        const cudaError_t status = try_launch_stream_k(std::integral_constant<int, 64>{}, g64);
+        if (status != cudaErrorInsufficientDriver) {
+          return status;
+        }
+      }
+    }
+
+    auto launch_persistent = [&](auto tile_n_tag) {
+      return CutlassGroupwiseScaledGEMMSM120LowLatency<ScaleGranularityM, ScaleGranularityN,
+                                                       ScaleGranularityK, ScaleMajorK,
+                                                       decltype(tile_n_tag)::value, false>(
+          float_buffer, workspace_size_in_bytes, A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr, m, n, k, l,
+          stream);
+    };
+
+    // 2. Persistent Swap-AB when it completes in <= waves of baseline 128x128.
+    if (m <= 96 && w32 <= w128) {
+      return launch_persistent(std::integral_constant<int, 32>{});
+    }
+    if (m <= 128 && w32 <= w128 && w32 == 1) {
+      return launch_persistent(std::integral_constant<int, 32>{});
+    }
+    if (m <= 256 && w64 <= w128) {
+      return launch_persistent(std::integral_constant<int, 64>{});
+    }
+    if (m <= 384 && w96 <= w128) {
+      return launch_persistent(std::integral_constant<int, 96>{});
+    }
+
+    // 3. Multi-wave tail-wave smoothing when 128x128 leaves a <= 50% tail wave.
+    if (w128 >= 2 && tail128 > 0 && tail128 <= sm / 2) {
+      if (m <= 256) {
+        const size_t t64 = g64 % sm;
+        const size_t t96 = g96 % sm;
+        if (m > 128 && !(t96 > 0 && t96 < sm / 4 && (t64 == 0 || t64 >= sm / 2))) {
+          return launch_persistent(std::integral_constant<int, 96>{});
+        }
+        return launch_persistent(std::integral_constant<int, 64>{});
+      }
+      if (m <= 384) {
+        return launch_persistent(std::integral_constant<int, 96>{});
+      }
+    }
+
+    return launch_baseline();
+  }
+}
 
 }  // namespace gemm
 }  // namespace flashinfer
@@ -130,47 +258,14 @@ void CutlassGemmGroupwiseScaledSM120(TensorView float_workspace_buffer, TensorVi
               return false;  // Unsupported tensor dimension
             }
 
-            cudaError_t status;
-            size_t workspace_size_in_bytes =
+            const size_t workspace_size_in_bytes =
                 get_element_size(float_workspace_buffer) * float_workspace_buffer.numel();
-            if constexpr (SCALE_GRANULARITY_M == 1) {
-              // Limit TileN=64 to underfilled grids; wide-N M=112 shapes regress with swap-AB.
-              const int num_m_tiles_128 = (m + 127) / 128;
-              const int num_n_tiles_128 = (n + 127) / 128;
-              if (m <= 96 || (m < 128 && (m % 4 != 0))) {
-                status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120LowLatency<
-                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
-                    32>(static_cast<void*>(float_workspace_buffer.data_ptr()),
-                        workspace_size_in_bytes, static_cast<cutlass_t_in*>(A.data_ptr()),
-                        static_cast<cutlass_t_in*>(B.data_ptr()),
-                        static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
-                        static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l, stream);
-              } else if (m <= 256 && (m % 4 == 0) && num_m_tiles_128 * num_n_tiles_128 <= 80) {
-                status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120LowLatency<
-                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
-                    64>(static_cast<void*>(float_workspace_buffer.data_ptr()),
-                        workspace_size_in_bytes, static_cast<cutlass_t_in*>(A.data_ptr()),
-                        static_cast<cutlass_t_in*>(B.data_ptr()),
-                        static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
-                        static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l, stream);
-              } else {
-                status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120<
-                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K>(
-                    static_cast<void*>(float_workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                    static_cast<cutlass_t_in*>(A.data_ptr()),
-                    static_cast<cutlass_t_in*>(B.data_ptr()), static_cast<float*>(SFA.data_ptr()),
-                    static_cast<float*>(SFB.data_ptr()), static_cast<cutlass_t_out*>(C.data_ptr()),
-                    m, n, k, l, stream);
-              }
-            } else {
-              status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120<
-                  SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K>(
-                  static_cast<void*>(float_workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                  static_cast<cutlass_t_in*>(A.data_ptr()),
-                  static_cast<cutlass_t_in*>(B.data_ptr()), static_cast<float*>(SFA.data_ptr()),
-                  static_cast<float*>(SFB.data_ptr()), static_cast<cutlass_t_out*>(C.data_ptr()), m,
-                  n, k, l, stream);
-            }
+            const cudaError_t status = flashinfer::gemm::SelectAndLaunchSM120Groupwise<
+                SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K>(
+                static_cast<void*>(float_workspace_buffer.data_ptr()), workspace_size_in_bytes,
+                static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
+                static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
+                static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l, stream);
             TVM_FFI_ICHECK_EQ(status, cudaSuccess)
                 << "Failed to run cutlass gemm groupwise scaled sm120: "
                 << cudaGetErrorString(status);
