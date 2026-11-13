@@ -13,10 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/utils.cuh>
 #include <type_traits>
 
 #include "tvm_ffi_utils.h"
@@ -91,6 +92,17 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120LowLatency(
     float* SFA_ptr, float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k, int l,
     cudaStream_t stream, int splits = 1, bool force_stream_k = false);
 
+inline int QueryActiveDeviceMultiProcessorCount() {
+  int device_id = 0;
+  int sm_count = 0;
+  if (cudaGetDevice(&device_id) == cudaSuccess &&
+      cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id) == cudaSuccess &&
+      sm_count > 0) {
+    return sm_count;
+  }
+  return 1;
+}
+
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_size_in_bytes,
@@ -112,7 +124,7 @@ cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_s
     }
 
     auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
-    const size_t sm = static_cast<size_t>(std::max(1, flashinfer::GetCudaMultiProcessorCount()));
+    const size_t sm = static_cast<size_t>(QueryActiveDeviceMultiProcessorCount());
     const size_t l_nt = static_cast<size_t>(l) * ceil_div(n, 128);
     const int kt = ceil_div(k, 128);
 

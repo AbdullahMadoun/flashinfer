@@ -16,11 +16,11 @@
 #ifndef FLASHINFER_GEMM_GEMM_GROUPWISE_SM120_CUH_
 #define FLASHINFER_GEMM_GEMM_GROUPWISE_SM120_CUH_
 
+#include <cuda_runtime.h>
 #include <flashinfer/allocator.h>
 
 #include <algorithm>
 #include <cassert>
-#include <flashinfer/utils.cuh>
 #include <iostream>
 #include <iterator>
 #include <type_traits>
@@ -45,9 +45,11 @@ namespace detail {
 
 inline cutlass::KernelHardwareInfo MakeCutlassHardwareInfo() {
   cutlass::KernelHardwareInfo hw_info{};
-  // Query the active device ID (multi-GPU safe); SM count is process-wide homogeneous.
-  cudaGetDevice(&hw_info.device_id);
-  hw_info.sm_count = flashinfer::GetCudaMultiProcessorCount();
+  // Query both the active device ID and its SM count per launch (multi-GPU safe).
+  if (cudaGetDevice(&hw_info.device_id) == cudaSuccess) {
+    hw_info.sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  }
   return hw_info;
 }
 
