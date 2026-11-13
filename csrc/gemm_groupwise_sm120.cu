@@ -136,7 +136,9 @@ cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_s
       return workspace_size_in_bytes >= (g * per_tile_bytes + 65536);
     };
     auto pick_split_factor = [&](size_t g) {
-      // Prefer fixed deterministic Split-K (2..4) once 4-way split occupies >= 50% of SMs.
+      // Fixed Split-K (2..4) only when a 4-way split fills at least half the SMs. Otherwise
+      // return 1 and let CUTLASS's Heuristic decomposition choose data-parallel or Stream-K.
+      // Both use the scheduler's default deterministic reduction.
       if (g * 8 < sm) {
         return 1;
       }

@@ -40,7 +40,6 @@
 namespace flashinfer {
 namespace gemm {
 
-// SM120 uses Cooperative schedule with 128x128x128 tile shape
 namespace detail {
 
 inline cutlass::KernelHardwareInfo MakeCutlassHardwareInfo() {
@@ -107,6 +106,7 @@ inline cudaError_t RunGroupwiseGemmOperator(typename Gemm::Arguments& arguments,
 
 }  // namespace detail
 
+// SM120 uses Cooperative schedule with 128x128x128 tile shape
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,

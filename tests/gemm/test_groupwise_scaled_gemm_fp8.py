@@ -285,6 +285,11 @@ def test_fp8_groupwise_gemm_small_batch_size(
     cc = compute_capability[0] * 10 + compute_capability[1]
     if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
         pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
+    # The extra M values, FP16 output and repeat check target the SM120 swap-AB
+    # tiles; other paths keep their earlier coverage.
+    sm120_cutlass = compute_capability[0] == 12 and backend == "cutlass"
+    if not sm120_cutlass and (m not in (1, 4, 16, 32) or out_dtype != torch.bfloat16):
+        pytest.skip("Extended small-M cases target the SM120 CUTLASS kernels.")
     if backend == "cutile":
         # M below BLOCK_M: partial M tile and the BLOCK_M <= M config prune.
         if scale_major_mode != "K":
@@ -293,8 +298,6 @@ def test_fp8_groupwise_gemm_small_batch_size(
             pytest.skip(
                 "cuda-tile / tileiras compiler not available in this environment."
             )
-    elif compute_capability[0] == 10 and m % 4 != 0:
-        pytest.skip("SM100 CUTLASS groupwise GEMM requires M to be a multiple of 4.")
     torch.random.manual_seed(0)
     tile_size = 128
 
@@ -327,6 +330,8 @@ def test_fp8_groupwise_gemm_small_batch_size(
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+    if not sm120_cutlass:
+        return
     c_repeat = gemm_fp8_nt_groupwise(
         a_fp8,
         b_fp8,
@@ -451,7 +456,8 @@ def _run_sm120_fp8_case(
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        # Small-K persistent transitions & unaligned partial tiles (32, 64, 96, 128)
+        # Small-K tile transitions and partial tiles; some land on the 128x128
+        # side of a boundary, depending on the SM count.
         (33, 10240, 256),
         (112, 10240, 256),
         (112, 14336, 256),
@@ -460,12 +466,13 @@ def _run_sm120_fp8_case(
         (257, 5120, 256),
         (384, 14336, 256),
         (385, 5120, 256),
-        # Large-K Stream-K / Split-K underfill & wave boundaries (TileN=32/64)
-        (17, 512, 2048),  # tiny grid -> TileN=32 Stream-K
-        (97, 1536, 8192),  # unaligned M > 96, deep-K -> TileN=32 Split-K
-        (112, 1536, 2048),  # underfill M > 96 -> TileN=32 Split-K
-        (161, 2560, 2048),  # medium-M underfill -> TileN=64 Split-K
-        (384, 2560, 2048),  # >sm/2 underfill -> TileN=64 forced Stream-K
+        # Large K, small grid: Stream-K scheduler kernels (TileN=32/64)
+        (17, 512, 2048),
+        (97, 1536, 8192),
+        (112, 1536, 2048),
+        (161, 2560, 2048),
+        (384, 2560, 2048),
+        (33, 512, 2560),  # K/128 not a multiple of 8
     ],
 )
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
@@ -537,10 +544,10 @@ def test_fp8_groupwise_gemm_sm120_zero_dimensions(m, n, k, granularity, out_dtyp
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (17, 512, 2048),  # TileN=32 Stream-K e5m2
-        (132, 5120, 256),  # TileN=64 Persistent e5m2
-        (161, 2560, 2048),  # TileN=64 Split-K e5m2
-        (384, 5120, 256),  # TileN=96 Persistent e5m2
+        (17, 512, 2048),  # Stream-K scheduler, TileN=32
+        (132, 5120, 256),  # persistent, TileN=64
+        (161, 2560, 2048),  # Stream-K scheduler, TileN=64
+        (384, 5120, 256),  # persistent, TileN=96
     ],
 )
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
@@ -554,9 +561,9 @@ def test_fp8_groupwise_gemm_sm120_e5m2(m, n, k, scale_major_mode, out_dtype):
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (17, 512, 2048),  # Stream-K workspace init on capture/non-default stream
-        (112, 1536, 2048),  # Split-K workspace init on capture/non-default stream
-        (384, 5120, 256),  # Persistent TileN=96
+        (17, 512, 2048),  # Stream-K scheduler: workspace init on the stream
+        (112, 1536, 2048),  # Stream-K scheduler: workspace init on the stream
+        (384, 5120, 256),  # persistent, TileN=96
     ],
 )
 def test_fp8_groupwise_gemm_sm120_stream_and_cuda_graph(m, n, k):
@@ -604,9 +611,10 @@ def test_fp8_groupwise_gemm_sm120_stream_and_cuda_graph(m, n, k):
 @pytest.mark.parametrize(
     "l,m,n,k",
     [
-        (4, 33, 512, 2048),  # 3D BMM underfilled -> Swap-AB Split-K/Stream-K
-        (8, 256, 2048, 256),  # 3D BMM tail-smoothing -> TileN=64 Persistent
-        (16, 17, 1024, 2048),  # 3D BMM -> TileN=32 Persistent/Split-K
+        (2, 17, 512, 2048),  # small grid: Stream-K scheduler, needs a workspace
+        (4, 33, 512, 2048),
+        (8, 256, 2048, 256),
+        (16, 17, 1024, 2048),
     ],
 )
 def test_fp8_groupwise_gemm_sm120_bmm_and_small_workspace(l, m, n, k, scale_major_mode):
@@ -646,23 +654,23 @@ def test_fp8_groupwise_gemm_sm120_bmm_and_small_workspace(l, m, n, k, scale_majo
     )
     torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
 
-    # Also verify tiny-workspace safe fallback to persistent Swap-AB (0B workspace)
-    if l == 4:
-        tiny_ws = torch.empty(1024, dtype=torch.uint8, device="cuda")
-        out_tiny = torch.empty((l, m, n), dtype=torch.bfloat16, device="cuda")
-        module.gemm_fp8_nt_groupwise(
-            tiny_ws,
-            a_fp8,
-            b_col,
-            a_scale,
-            b_scale,
-            out_tiny,
-            1,
-            128,
-            128,
-            scale_major_mode,
-        )
-        torch.testing.assert_close(out_tiny, ref_c, atol=1e-2, rtol=1e-2)
+    # A workspace too small for the Stream-K scheduler falls back to the
+    # persistent kernel, which needs none.
+    tiny_ws = torch.empty(1024, dtype=torch.uint8, device="cuda")
+    out_tiny = torch.empty((l, m, n), dtype=torch.bfloat16, device="cuda")
+    module.gemm_fp8_nt_groupwise(
+        tiny_ws,
+        a_fp8,
+        b_col,
+        a_scale,
+        b_scale,
+        out_tiny,
+        1,
+        128,
+        128,
+        scale_major_mode,
+    )
+    torch.testing.assert_close(out_tiny, ref_c, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("backend", ["trtllm", "cutile"])
