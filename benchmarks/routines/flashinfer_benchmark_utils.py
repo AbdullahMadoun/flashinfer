@@ -610,8 +610,8 @@ routine_cc_to_supported_backends = {
         "10.0": ["cutlass", "auto", "batch_invariant"],
         "10.3": ["cutlass", "auto", "batch_invariant"],
         "10.7": ["cutlass", "cute-dsl", "auto", "batch_invariant"],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["cutlass", "auto"],
+        "12.1": ["cutlass", "auto"],
     },
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
