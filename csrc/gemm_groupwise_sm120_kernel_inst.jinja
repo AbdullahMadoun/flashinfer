@@ -28,7 +28,7 @@ namespace gemm {
 template cudaError_t
 CutlassGroupwiseScaledGEMMSM120<
     {{ scale_granularity_m }}, {{ scale_granularity_n }}, {{ scale_granularity_k }},
-    {{ scale_major_k }},
+    {{ scale_major_k }}, false,
     {{ dtype_in }},
     {{ dtype_out }}>(
         void* float_buffer, size_t float_buffer_size_in_bytes,
@@ -37,6 +37,16 @@ CutlassGroupwiseScaledGEMMSM120<
 {% endfor %}
 {% endfor %}
 {% endfor %}
+
+// 128x128 with the Stream-K scheduler, used by the ScaleGranularityM == 1 dispatch only.
+template cudaError_t
+CutlassGroupwiseScaledGEMMSM120<
+    1, 128, 128, {{ scale_major_k }}, true,
+    {{ dtype_in }},
+    {{ dtype_out }}>(
+        void* float_buffer, size_t float_buffer_size_in_bytes,
+        {{ dtype_in }}* A_ptr, {{ dtype_in }}* B_ptr, float* SFA_ptr, float* SFB_ptr,
+        {{ dtype_out }}* D_ptr, int m, int n, int k, int l, cudaStream_t stream);
 
 {% for scale_granularity_n in [128] %}
 {% for scale_granularity_k in [128] %}

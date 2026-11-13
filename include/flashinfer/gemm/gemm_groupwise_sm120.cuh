@@ -106,9 +106,11 @@ inline cudaError_t RunGroupwiseGemmOperator(typename Gemm::Arguments& arguments,
 
 }  // namespace detail
 
-// SM120 uses Cooperative schedule with 128x128x128 tile shape
+// SM120 uses Cooperative schedule with 128x128x128 tile shape.
+// UseStreamK selects CUTLASS's StreamKScheduler (default Heuristic decomposition) for grids whose
+// last wave would leave most SMs idle.
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          typename DTypeIn, typename DTypeOut>
+          bool UseStreamK = false, typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
@@ -179,9 +181,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
       AlignmentB, ElementAccumulator, MmaTileShape_MNK, ClusterShape_MNK, StageCount,
       cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
+  using TileScheduler = cute::conditional_t<UseStreamK, cutlass::gemm::StreamKScheduler, void>;
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
-                                           CollectiveEpilogue, void>;
+                                           CollectiveEpilogue, TileScheduler>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 

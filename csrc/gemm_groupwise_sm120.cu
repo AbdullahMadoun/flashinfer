@@ -79,7 +79,7 @@ namespace flashinfer {
 namespace gemm {
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
-          typename DTypeIn, typename DTypeOut>
+          bool UseStreamK = false, typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
                                             float* SFB_ptr, DTypeOut* C_ptr, int m, int n, int k,
@@ -180,8 +180,12 @@ cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_s
         }
       }
 
-      const bool use_sw64_sk =
-          (m > 96) && (m <= 256 ? g64 <= sm / 2 : m <= 384 && g64 <= (sm * 2) / 3);
+      // At 96 < m <= 128, g64 <= sm / 2 implies the TileN-32 grid fits in one wave, and that
+      // persistent kernel (step 2) is faster unless K is very long: measured on 188 SMs, it wins
+      // at K/128 <= 96 and loses at K/128 = 136, so split only from K/128 >= 128.
+      const bool use_sw64_sk = (m > 96) && (m <= 128   ? kt >= 128 && g64 <= sm / 2
+                                            : m <= 256 ? g64 <= sm / 2
+                                                       : m <= 384 && g64 <= (sm * 2) / 3);
       if (use_sw64_sk) {
         const cudaError_t status = try_launch_stream_k(std::integral_constant<int, 64>{}, g64);
         if (status != cudaErrorInsufficientDriver) {
@@ -227,6 +231,19 @@ cudaError_t SelectAndLaunchSM120Groupwise(void* float_buffer, size_t workspace_s
       }
     }
 
+    // 4. 128x128. If its last wave would leave more than half the SMs idle, use Stream-K so the
+    //    idle SMs share the K loop (same rule as SGLang's SM120 fp8_blockwise_scaled_mm).
+    const size_t last_wave128 = (tail128 == 0) ? sm : tail128;
+    if (last_wave128 * 2 < sm && fits_streamk_ws(g128, 128)) {
+      const cudaError_t status =
+          CutlassGroupwiseScaledGEMMSM120<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK,
+                                          ScaleMajorK, true>(float_buffer, workspace_size_in_bytes,
+                                                             A_ptr, B_ptr, SFA_ptr, SFB_ptr, C_ptr,
+                                                             m, n, k, l, stream);
+      if (status != cudaErrorInsufficientDriver) {
+        return status;
+      }
+    }
     return launch_baseline();
   }
 }

@@ -473,6 +473,12 @@ def _run_sm120_fp8_case(
         (161, 2560, 2048),
         (384, 2560, 2048),
         (33, 512, 2560),  # K/128 not a multiple of 8
+        # 96 < M <= 128 with a one-wave TileN-32 grid: persistent below K/128 = 128, Split-K above
+        (112, 5120, 2048),
+        (112, 4096, 17408),
+        # 128x128 with a mostly idle last wave: Stream-K 128x128 (192 tiles on 170-188 SMs)
+        (512, 6144, 5120),
+        (513, 1024, 256),  # few tiles, short K
     ],
 )
 @pytest.mark.parametrize("scale_major_mode", ["MN", "K"])
